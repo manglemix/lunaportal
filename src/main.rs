@@ -65,15 +65,17 @@ pub async fn start(ws: WebSocketUpgrade, mut info: ConnectInfo<SocketAddr>) -> R
 
         let mut child = match Command::new("/home/naj/.cargo/bin/lunabot")
             // .env("SERVER_ADDR", info.0.to_string())
+            .current_dir("/home/naj/lunaportal")
             .stderr(Stdio::piped())
             .stdout(Stdio::piped())
-            .spawn() {
-                Ok(x) => x,
-                Err(e) => {
-                    let _ = ws.send(format!("Failed to start: {e}").into()).await;
-                    return;
-                }
-            };
+            .spawn()
+        {
+            Ok(x) => x,
+            Err(e) => {
+                let _ = ws.send(format!("Failed to start: {e}").into()).await;
+                return;
+            }
+        };
 
         let mut stdout = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();
@@ -92,38 +94,31 @@ pub async fn start(ws: WebSocketUpgrade, mut info: ConnectInfo<SocketAddr>) -> R
         };
 
         let sigint = || {
-            Command::new("kill")
-                .arg("-2")
-                .arg(pid.to_string())
-                .output()
+            eprintln!("SIGINT {pid}");
+            Command::new("kill").arg("-2").arg(pid.to_string()).output()
         };
 
         let end = |mut ws: WebSocket, child: Child| async move {
             match sigint().await {
-                    Ok(output) => if output.status.success() {
+                Ok(output) => {
+                    if output.status.success() {
                         tokio::select! {
-                            result = child.wait_with_output() => {
-                                match result {
-                                    Ok(output) => if !output.status.success() {
-                                        let e = String::from_utf8_lossy(&output.stderr);
-                                        let _ = ws.send(format!("Failed to kill: {e}").into()).await;
-                                    }
-                                    Err(e) => {
-                                        let _ = ws.send(format!("Failed to kill: {e}").into()).await;
-                                    }
-                                }
-                            }
+                            _ = child.wait_with_output() => { }
                             _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
                                 let _ = sigint().await;
                             }
                         }
+                    } else {
+                        let e = String::from_utf8_lossy(&output.stderr);
+                        eprintln!("kill failed to execute: {e}");
+                        let _ = ws.send(format!("kill failed to execute: {e}").into()).await;
                     }
-                 else {
-                    let e = String::from_utf8_lossy(&output.stderr);
-                    let _ = ws.send(format!("Failed to kill: {e}").into()).await;
                 }
                 Err(e) => {
-                    let _ = ws.send(format!("Failed to kill: {e}").into()).await;
+                    eprintln!("Failed to SIGINT the first time: {e}");
+                    let _ = ws
+                        .send(format!("Failed to SIGINT the first time: {e}").into())
+                        .await;
                 }
             }
             let _ = ws.close().await;
@@ -155,6 +150,10 @@ pub async fn start(ws: WebSocketUpgrade, mut info: ConnectInfo<SocketAddr>) -> R
                         end(ws, child).await;
                         break;
                     };
+                    if let Message::Close(_) = &msg {
+                        end(ws, child).await;
+                        break;
+                    }
                     let Message::Text(msg) = msg else {
                         send!("Invalid message");
                         continue;
