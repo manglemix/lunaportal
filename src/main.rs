@@ -94,7 +94,6 @@ pub async fn start(ws: WebSocketUpgrade, mut info: ConnectInfo<SocketAddr>) -> R
         };
 
         let sigint = || {
-            eprintln!("SIGINT {pid}");
             Command::new("kill").arg("-2").arg(pid.to_string()).output()
         };
 
