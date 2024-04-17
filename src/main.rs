@@ -1,5 +1,5 @@
 
-use std::{net::SocketAddr, process::Stdio};
+use std::{net::SocketAddr, process::Stdio, sync::{Arc, OnceLock}};
 
 use axum::{
     extract::{ws::{Message, WebSocket}, ConnectInfo, WebSocketUpgrade},
@@ -7,23 +7,30 @@ use axum::{
     routing::get,
     Router,
 };
-use tokio::{io::AsyncReadExt, process::{Child, Command}, sync::{Mutex, Notify}};
+use tokio::{io::AsyncReadExt, process::{Child, Command}, sync::{mpsc, Mutex, Notify}};
 
 static PROC_LOCK: Mutex<()> = Mutex::const_new(());
-static END: Notify = Notify::const_new();
+static END_RECV: OnceLock<Mutex<mpsc::UnboundedReceiver<Arc<Notify>>>> = OnceLock::new();
 
 #[tokio::main]
 async fn main() {
     // build our application with a route
     let app = Router::new().route("/", get(start));
+    let (sender, receiver) = mpsc::unbounded_channel();
+    END_RECV.set(Mutex::new(receiver)).unwrap();
 
     // run our app with hyper, listening globally on port 80
     let listener = tokio::net::TcpListener::bind("0.0.0.0:80").await.unwrap();
     tokio::select! {
-        result = async { axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await } => {
-            result.unwrap();
+        result = tokio::spawn(async { axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await }) => {
+            result.unwrap().unwrap();
         }
-        _ = END.notified() => {}
+        result = tokio::signal::ctrl_c() => {
+            result.unwrap();
+            let notify = Arc::new(Notify::new());
+            sender.send(notify.clone()).unwrap();
+            notify.notified().await;
+        }
     }
 }
 
@@ -44,9 +51,10 @@ pub async fn start(ws: WebSocketUpgrade, mut info: ConnectInfo<SocketAddr>) -> R
         }
 
         info.0.set_port(43721);
+        std::fs::write("settings.toml", format!("server_addr = \"{}\"", info.0)).unwrap();
 
         let mut child = match Command::new("lunabot")
-            .env("SERVER_ADDR", info.0.to_string())
+            // .env("SERVER_ADDR", info.0.to_string())
             .stderr(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn() {
@@ -125,6 +133,8 @@ pub async fn start(ws: WebSocketUpgrade, mut info: ConnectInfo<SocketAddr>) -> R
         let mut stdout_buf = [0u8; 512];
         let mut stdout_msg = vec![];
 
+        let mut end_recv = END_RECV.get().unwrap().lock().await;
+
         loop {
             tokio::select! {
                 option = ws.recv() => {
@@ -189,10 +199,10 @@ pub async fn start(ws: WebSocketUpgrade, mut info: ConnectInfo<SocketAddr>) -> R
                         stdout_msg.drain(0..=n);
                     }
                 }
-                result = tokio::signal::ctrl_c() => {
-                    let Ok(()) = result else { continue; };
+                result = end_recv.recv() => {
+                    let notify = result.unwrap();
                     end(ws, child).await;
-                    END.notify_one();
+                    notify.notify_one();
                     break;
                 }
             }
