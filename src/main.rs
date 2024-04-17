@@ -1,23 +1,30 @@
-
-use std::{net::SocketAddr, process::Stdio, sync::{Arc, OnceLock}};
+use std::{net::SocketAddr, process::Stdio};
 
 use axum::{
-    extract::{ws::{Message, WebSocket}, ConnectInfo, WebSocketUpgrade},
+    extract::{
+        ws::{Message, WebSocket},
+        ConnectInfo, WebSocketUpgrade,
+    },
     response::Response,
     routing::get,
     Router,
 };
-use tokio::{io::AsyncReadExt, process::{Child, Command}, sync::{mpsc, Mutex, Notify}};
+use tokio::{
+    io::AsyncReadExt,
+    process::{Child, Command},
+    sync::{mpsc, Mutex},
+};
 
 static PROC_LOCK: Mutex<()> = Mutex::const_new(());
-static END_RECV: OnceLock<Mutex<mpsc::UnboundedReceiver<Arc<Notify>>>> = OnceLock::new();
+static END_RECV: Mutex<Option<mpsc::UnboundedReceiver<mpsc::UnboundedSender<()>>>> =
+    Mutex::const_new(None);
 
 #[tokio::main]
 async fn main() {
     // build our application with a route
     let app = Router::new().route("/", get(start));
     let (sender, receiver) = mpsc::unbounded_channel();
-    END_RECV.set(Mutex::new(receiver)).unwrap();
+    *END_RECV.lock().await = Some(receiver);
 
     // run our app with hyper, listening globally on port 80
     let listener = tokio::net::TcpListener::bind("0.0.0.0:80").await.unwrap();
@@ -27,9 +34,12 @@ async fn main() {
         }
         result = tokio::signal::ctrl_c() => {
             result.unwrap();
-            let notify = Arc::new(Notify::new());
-            sender.send(notify.clone()).unwrap();
-            notify.notified().await;
+            let (subsender, mut subreceiver) = mpsc::unbounded_channel();
+            sender.send(subsender).unwrap();
+            if let Ok(mut end_recv) = END_RECV.try_lock() {
+                *end_recv = None;
+            }
+            subreceiver.recv().await;
         }
     }
 }
@@ -53,7 +63,7 @@ pub async fn start(ws: WebSocketUpgrade, mut info: ConnectInfo<SocketAddr>) -> R
         info.0.set_port(43721);
         std::fs::write("settings.toml", format!("server_addr = \"{}\"", info.0)).unwrap();
 
-        let mut child = match Command::new("lunabot")
+        let mut child = match Command::new("/home/naj/.cargo/bin/lunabot")
             // .env("SERVER_ADDR", info.0.to_string())
             .stderr(Stdio::piped())
             .stdout(Stdio::piped())
@@ -64,10 +74,10 @@ pub async fn start(ws: WebSocketUpgrade, mut info: ConnectInfo<SocketAddr>) -> R
                     return;
                 }
             };
-        
+
         let mut stdout = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();
-        
+
         let Some(pid) = child.id() else {
             let output = match child.wait_with_output().await {
                 Ok(x) => x,
@@ -118,7 +128,7 @@ pub async fn start(ws: WebSocketUpgrade, mut info: ConnectInfo<SocketAddr>) -> R
             }
             let _ = ws.close().await;
         };
-        
+
         macro_rules! send {
             ($msg: expr) => {
                 if ws.send($msg.into()).await.is_err() {
@@ -126,14 +136,17 @@ pub async fn start(ws: WebSocketUpgrade, mut info: ConnectInfo<SocketAddr>) -> R
                 }
             };
         }
-        
+
         let mut stderr_buf = [0u8; 512];
         let mut stderr_msg = vec![];
-        
+
         let mut stdout_buf = [0u8; 512];
         let mut stdout_msg = vec![];
 
-        let mut end_recv = END_RECV.get().unwrap().lock().await;
+        let mut end_recv = END_RECV.lock().await;
+        let end_recv = end_recv.as_mut().unwrap();
+
+        let mut mute = false;
 
         loop {
             tokio::select! {
@@ -147,7 +160,12 @@ pub async fn start(ws: WebSocketUpgrade, mut info: ConnectInfo<SocketAddr>) -> R
                         continue;
                     };
                     match msg.as_str() {
-                        
+                        "mute" => {
+                            mute = true;
+                        }
+                        "unmute" => {
+                            mute = false;
+                        }
                         _ => {
                             send!("Invalid message");
                         }
@@ -172,7 +190,9 @@ pub async fn start(ws: WebSocketUpgrade, mut info: ConnectInfo<SocketAddr>) -> R
                         continue;
                     };
                     if let Some(n) = stderr_str.find('\n') {
-                        send!(stderr_str.split_at(n).0);
+                        if !mute {
+                            send!(stderr_str.split_at(n).0);
+                        }
                         stderr_msg.drain(0..=n);
                     }
                 }
@@ -195,14 +215,16 @@ pub async fn start(ws: WebSocketUpgrade, mut info: ConnectInfo<SocketAddr>) -> R
                         continue;
                     };
                     if let Some(n) = stdout_str.find('\n') {
-                        send!(stdout_str.split_at(n).0);
+                        if !mute {
+                            send!(stdout_str.split_at(n).0);
+                        }
                         stdout_msg.drain(0..=n);
                     }
                 }
                 result = end_recv.recv() => {
-                    let notify = result.unwrap();
+                    let sender = result.unwrap();
                     end(ws, child).await;
-                    notify.notify_one();
+                    let _ = sender.send(());
                     break;
                 }
             }
